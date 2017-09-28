@@ -106,7 +106,7 @@ case class CommandContainer(command: Option[SchemaGuruCommand] = None) {
 
   def setDb(name: String): Option[SchemaGuruCommand] =
     command match {
-      case Some(ddl: DdlCommand) => Some(ddl.copy(db = name))
+      case Some(ddl: DdlCommand) => Some(ddl.copy(db = Some(name)))
       case other => other
     }
 

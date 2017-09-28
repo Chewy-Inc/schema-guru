@@ -26,8 +26,10 @@ import java.io.File
 // Schema DDL
 import com.snowplowanalytics.schemaddl.SchemaData.{ FlatSchema, SelfDescInfo }
 import com.snowplowanalytics.schemaddl.generators.SchemaFlattener.flattenJsonSchema
-import com.snowplowanalytics.schemaddl.generators.redshift.{ RedshiftDdlGenerator => RDG, Ddl }
-import com.snowplowanalytics.schemaddl.generators.redshift.JsonPathGenerator.getJsonPathsFile
+import com.snowplowanalytics.schemaddl.generators.redshift.{ RedshiftDdlGenerator => RDG, Ddl => rDdl }
+import com.snowplowanalytics.schemaddl.generators.redshift.JsonPathGenerator.{ getJsonPathsFile => rGetJsonPathsFile}
+import com.snowplowanalytics.schemaddl.generators.vertica.{ VerticaDdlGenerator => VDG, Ddl => vDdl }
+import com.snowplowanalytics.schemaddl.generators.vertica.JsonPathGenerator.{ getJsonPathsFile => vGetJsonPathsFile}
 import com.snowplowanalytics.schemaddl.utils.{ StringUtils => SU }
 
 // This library
@@ -40,7 +42,7 @@ import utils.FileSystemJsonGetters.getJsonFiles
 case class DdlCommand private[cli] (
   input: File,
   output: File,
-  db: String = "redshift",        // Isn't checked anywhere
+  db: Option[String] = None,      // Isn't checked anywhere
   withJsonPaths: Boolean = false,
   rawMode: Boolean = false,
   schema: Option[String] = None,  // empty for raw, "atomic" for non-raw
@@ -64,6 +66,9 @@ case class DdlCommand private[cli] (
    * and output them to specified path, also output errors
    */
   def processDdl(): Unit = {
+    val dbName = db.getOrElse("vertica")
+    val isVertica = dbName == "vertica"
+
     val allFiles: ValidJsonFileList = getJsonFiles(input)
     val (failures, jsons) = splitValidations(allFiles)
 
@@ -76,8 +81,17 @@ case class DdlCommand private[cli] (
       case Nil       => sys.error(s"Directory [${input.getAbsolutePath}] does not contain any valid JSON files")
       case someJsons =>
         val outputs =
-          if (rawMode) transformRaw(someJsons)
-          else transformSelfDescribing(someJsons)
+          if (rawMode) {
+            if (isVertica)
+               transformVerticaRaw(someJsons)
+            else
+               transformRedshiftRaw(someJsons)
+          } else {
+            if (isVertica)
+              transformVerticaSelfDescribing(someJsons)
+            else
+              transformRedshiftSelfDescribing(someJsons)
+          }
         outputResult(outputs)
     }
   }
@@ -91,15 +105,16 @@ case class DdlCommand private[cli] (
    * @param files list of valid JSON Files, supposed to be Self-describing JSON Schemas
    * @return transformation result containing all data to output
    */
-  private def transformSelfDescribing(files: List[JsonFile]): DdlOutput = {
+  private def transformRedshiftSelfDescribing(files: List[JsonFile]): DdlOutput = {
+
     val dbSchema = schema.getOrElse("atomic")
     // Parse Self-describing Schemas
     val (schemaErrors, schemas) = splitValidations(files.map(_.extractSelfDescribingSchema))
 
     // Build table definitions from JSON Schemas
-    val validatedDdls = schemas.map(schema => selfDescSchemaToDdl(schema, dbSchema).map(ddl => (schema.self, ddl)))
+    val validatedDdls = schemas.map(schema => selfDescSchemaToRedshiftDdl(schema, dbSchema).map(ddl => (schema.self, ddl)))
     val (ddlErrors, ddlPairs) = splitValidations(validatedDdls)
-    val ddlMap = groupWithLast(ddlPairs)
+    val ddlMap = groupWithRedshiftLast(ddlPairs)
 
     // Build migrations and order-related data
     val migrationMap = Migrations.buildMigrationMap(schemas)
@@ -117,7 +132,43 @@ case class DdlCommand private[cli] (
     // Build DDL-files and JSONPaths file (in correct order and camelCased column names)
     val outputPair = for {
       ddl <- ddlFiles
-    } yield (makeDdlFile(ddl), makeJsonPaths(ddl))
+    } yield (makeRedshiftDdlFile(ddl), makeRedshiftJsonPaths(ddl))
+
+    DdlOutput(
+      outputPair.map(_._1),
+      migrations,
+      outputPair.flatMap(_._2),
+      warnings = schemaErrors ++ ddlErrors ++ ddlWarnings)
+  }
+
+  private def transformVerticaSelfDescribing(files: List[JsonFile]): DdlOutput = {
+
+    val dbSchema = schema.getOrElse("atomic")
+    // Parse Self-describing Schemas
+    val (schemaErrors, schemas) = splitValidations(files.map(_.extractSelfDescribingSchema))
+
+    // Build table definitions from JSON Schemas
+    val validatedDdls = schemas.map(schema => selfDescSchemaToVerticaDdl(schema, dbSchema).map(ddl => (schema.self, ddl)))
+    val (ddlErrors, ddlPairs) = splitValidations(validatedDdls)
+    val ddlMap = groupWithVerticaLast(ddlPairs)
+
+    // Build migrations and order-related data
+    val migrationMap = Migrations.buildMigrationMap(schemas)
+    val validOrderingMap = Migrations.getOrdering(migrationMap)
+    val orderingMap = validOrderingMap.collect { case (k, Success(v)) => (k, v) }
+    val (migrationErrors, migrations) = splitValidations(Migrations.reifyMigrationMap(migrationMap, Some(dbSchema), varcharSize))
+
+    // Order table-definitions according with migrations
+    val ddlFiles = ddlMap.map { case (description, table) =>
+      val order = orderingMap.getOrElse(description.revisionCriterion, Nil)
+      table.reorderTable(order)
+    }.toList
+    val ddlWarnings = ddlFiles.flatMap(_.table.warnings)
+
+    // Build DDL-files and JSONPaths file (in correct order and camelCased column names)
+    val outputPair = for {
+      ddl <- ddlFiles
+    } yield (makeVerticaDdlFile(ddl), makeVerticaJsonPaths(ddl))
 
     DdlOutput(
       outputPair.map(_._1),
@@ -133,10 +184,20 @@ case class DdlCommand private[cli] (
    * @param dbSchema DB schema name ("atomic")
    * @return validation of either table definition or error message
    */
-  private def selfDescSchemaToDdl(schema: Schema, dbSchema: String): Validation[String, TableDefinition] = {
+  private def selfDescSchemaToRedshiftDdl(schema: Schema, dbSchema: String): Validation[String, RedshiftTableDefinition] = {
     val ddl = for {
-      flatSchema <- flattenJsonSchema(schema.data, splitProduct)
-    } yield produceTable(flatSchema, schema.self, dbSchema)
+        flatSchema <- flattenJsonSchema(schema.data, splitProduct)
+      } yield produceRedShiftTable(flatSchema, schema.self, dbSchema) 
+    ddl match {
+      case Failure(fail) => (fail + s" in [${schema.self.toPath}] Schema").failure
+      case success => success
+    }
+  }
+
+  private def selfDescSchemaToVerticaDdl(schema: Schema, dbSchema: String): Validation[String, VerticaTableDefinition] = {
+    val ddl = for {
+        flatSchema <- flattenJsonSchema(schema.data, splitProduct)
+      } yield produceVerticaTable(flatSchema, schema.self, dbSchema) 
     ddl match {
       case Failure(fail) => (fail + s" in [${schema.self.toPath}] Schema").failure
       case success => success
@@ -151,13 +212,22 @@ case class DdlCommand private[cli] (
    * @param dbSchema DB schema name ("atomic")
    * @return table definition
    */
-  private def produceTable(flatSchema: FlatSchema, description: SchemaDescription, dbSchema: String): TableDefinition = {
-    val schemaCreate = Ddl.Schema(dbSchema).toDdl
+  private def produceRedShiftTable(flatSchema: FlatSchema, description: SchemaDescription, dbSchema: String): RedshiftTableDefinition = {
+    val schemaCreate = rDdl.Schema(dbSchema).toDdl
     val combined     = getFileName(description)
     val tableName    = SU.getTableName(description)
     val table        = RDG.getTableDdl(flatSchema, tableName, Some(dbSchema), varcharSize, rawMode)
     val comment      = RDG.getTableComment(tableName, Some(dbSchema), description)
-    TableDefinition(combined._1, combined._2, RDG.RedshiftDdlHeader, schemaCreate, table, comment)
+    RedshiftTableDefinition(combined._1, combined._2, RDG.RedshiftDdlHeader, schemaCreate, table, comment)
+  }
+
+  private def produceVerticaTable(flatSchema: FlatSchema, description: SchemaDescription, dbSchema: String): VerticaTableDefinition = {
+    val schemaCreate = vDdl.Schema(dbSchema).toDdl
+    val combined     = getFileName(description)
+    val tableName    = SU.getTableName(description)
+    val table        = VDG.getTableDdl(flatSchema, tableName, Some(dbSchema), varcharSize, rawMode)
+    val comment      = VDG.getTableComment(tableName, Some(dbSchema), description)
+    VerticaTableDefinition(combined._1, combined._2, VDG.RedshiftDdlHeader, schemaCreate, table, comment)
   }
 
 
@@ -171,13 +241,24 @@ case class DdlCommand private[cli] (
    * @param files list of JSON Files (assuming JSON Schemas)
    * @return transformation result containing all data to output
    */
-  private def transformRaw(files: List[JsonFile]): DdlOutput = {
-    val (schemaErrors, ddlFiles) = splitValidations(files.map(jsonToRawTable))
+  private def transformRedshiftRaw(files: List[JsonFile]): DdlOutput = {
+    val (schemaErrors, ddlFiles) = splitValidations(files.map(jsonToRedshiftRawTable))
     val ddlWarnings = ddlFiles.flatMap(_.table.warnings)
 
     val outputPair = for {
       ddl <- ddlFiles
-    } yield (makeDdlFile(ddl), makeJsonPaths(ddl))
+    } yield (makeRedshiftDdlFile(ddl), makeRedshiftJsonPaths(ddl))
+
+    DdlOutput(outputPair.map(_._1), Nil, outputPair.flatMap(_._2), warnings = schemaErrors ++ ddlWarnings)
+  }
+
+  private def transformVerticaRaw(files: List[JsonFile]): DdlOutput = {
+    val (schemaErrors, ddlFiles) = splitValidations(files.map(jsonToVerticaRawTable))
+    val ddlWarnings = ddlFiles.flatMap(_.table.warnings)
+
+    val outputPair = for {
+      ddl <- ddlFiles
+    } yield (makeVerticaDdlFile(ddl), makeVerticaJsonPaths(ddl))
 
     DdlOutput(outputPair.map(_._1), Nil, outputPair.flatMap(_._2), warnings = schemaErrors ++ ddlWarnings)
   }
@@ -188,9 +269,19 @@ case class DdlCommand private[cli] (
    * @param json JSON Schema
    * @return validated table definition object
    */
-  private def jsonToRawTable(json: JsonFile): Validation[String, TableDefinition] = {
+  private def jsonToRedshiftRawTable(json: JsonFile): Validation[String, RedshiftTableDefinition] = {
     val ddl = flattenJsonSchema(json.content, splitProduct).map { flatSchema =>
-      produceRawTable(flatSchema, json.fileName)
+      produceRedshiftRawTable(flatSchema, json.fileName)
+    }
+    ddl match {
+      case Failure(fail) => (fail + s" in [${json.fileName}] file").failure
+      case success => success
+    }
+  }
+
+  private def jsonToVerticaRawTable(json: JsonFile): Validation[String, VerticaTableDefinition] = {
+    val ddl = flattenJsonSchema(json.content, splitProduct).map { flatSchema =>
+      produceVerticaRawTable(flatSchema, json.fileName)
     }
     ddl match {
       case Failure(fail) => (fail + s" in [${json.fileName}] file").failure
@@ -208,12 +299,20 @@ case class DdlCommand private[cli] (
    * @param fileName JSON file, containing filename and content
    * @return DDL File object with all required information to output it
    */
-  private def produceRawTable(flatSchema: FlatSchema, fileName: String): TableDefinition = {
+  private def produceRedshiftRawTable(flatSchema: FlatSchema, fileName: String): RedshiftTableDefinition = {
     val name         = if (fileName.endsWith(".json")) fileName.dropRight(5) else fileName
-    val schemaCreate = schema.map(Ddl.Schema(_).toDdl).getOrElse("")
+    val schemaCreate = schema.map(rDdl.Schema(_).toDdl).getOrElse("")
     val table        = RDG.getTableDdl(flatSchema, name, schema, varcharSize, rawMode)
     val comment      = RDG.getTableComment(name, schema, fileName)
-    TableDefinition(".", name, RDG.RedshiftDdlHeader, schemaCreate, table, comment)
+    RedshiftTableDefinition(".", name, RDG.RedshiftDdlHeader, schemaCreate, table, comment)
+  }
+
+  private def produceVerticaRawTable(flatSchema: FlatSchema, fileName: String): VerticaTableDefinition = {
+    val name         = if (fileName.endsWith(".json")) fileName.dropRight(5) else fileName
+    val schemaCreate = schema.map(vDdl.Schema(_).toDdl).getOrElse("")
+    val table        = VDG.getTableDdl(flatSchema, name, schema, varcharSize, rawMode)
+    val comment      = VDG.getTableComment(name, schema, fileName)
+    VerticaTableDefinition(".", name, VDG.RedshiftDdlHeader, schemaCreate, table, comment)
   }
 
 
@@ -225,12 +324,20 @@ case class DdlCommand private[cli] (
    * @param ddl table definition object
    * @return text file with Redshift table DDL
    */
-  private def makeDdlFile(ddl: TableDefinition): TextFile = {
+  private def makeRedshiftDdlFile(ddl: RedshiftTableDefinition): TextFile = {
     val header = if (noHeader) "" else ddl.header ++ "\n\n"
     val schemaCreate = if (ddl.schemaCreate.isEmpty) "" else ddl.schemaCreate ++ "\n\n"
     val tableDefinition = header ++ schemaCreate ++ ddl.snakifyTable.toDdl ++ "\n\n" ++ ddl.comment.toDdl
     TextFile(new File(new File(ddl.path), ddl.fileName + ".sql"), tableDefinition)
   }
+
+  private def makeVerticaDdlFile(ddl: VerticaTableDefinition): TextFile = {
+    val header = if (noHeader) "" else ddl.header ++ "\n\n"
+    val schemaCreate = if (ddl.schemaCreate.isEmpty) "" else ddl.schemaCreate ++ "\n\n"
+    val tableDefinition = header ++ schemaCreate ++ ddl.snakifyTable.toDdl ++ "\n\n" ++ ddl.comment.toDdl
+    TextFile(new File(new File(ddl.path), ddl.fileName + ".sql"), tableDefinition)
+  }
+
 
   /**
    * Make JSONPath file out of table definition
@@ -238,8 +345,15 @@ case class DdlCommand private[cli] (
    * @param ddl table definition
    * @return text file with JSON Paths if option is set
    */
-  private def makeJsonPaths(ddl: TableDefinition): Option[TextFile] = {
-    val jsonPath = withJsonPaths.option(getJsonPathsFile(ddl.table.columns, rawMode))
+  private def makeRedshiftJsonPaths(ddl: RedshiftTableDefinition): Option[TextFile] = {
+    val jsonPath = withJsonPaths.option(rGetJsonPathsFile(ddl.table.columns, rawMode))
+    jsonPath.map { content =>
+      TextFile(new File(new File(ddl.path), ddl.fileName + ".json"), content)
+    }
+  }
+
+  private def makeVerticaJsonPaths(ddl: VerticaTableDefinition): Option[TextFile] = {
+    val jsonPath = withJsonPaths.option(vGetJsonPathsFile(ddl.table.columns, rawMode))
     jsonPath.map { content =>
       TextFile(new File(new File(ddl.path), ddl.fileName + ".json"), content)
     }
@@ -300,17 +414,17 @@ private[cli] object DdlCommand {
    * @param table table object
    * @param comment table comment object
    */
-  case class TableDefinition(
+  case class RedshiftTableDefinition(
     path: String,
     fileName: String,
     header: String,
     schemaCreate: String,
-    table: Ddl.Table,
-    comment: Ddl.Comment) {
+    table: rDdl.Table,
+    comment: rDdl.Comment) {
     /**
      * Get same DDL file with all column names being snakified
      */
-    def snakifyTable: Ddl.Table = {
+    def snakifyTable: rDdl.Table = {
       val snakified = table.columns.map { column =>
         column.copy(columnName = SU.snakify(column.columnName)) }
       table.copy(columns = snakified)
@@ -325,7 +439,7 @@ private[cli] object DdlCommand {
      *              appended to the end of table
      * @return DDL file object with reordered columns
      */
-    def reorderTable(order: List[String]): TableDefinition = {
+    def reorderTable(order: List[String]): RedshiftTableDefinition = {
       val columns = table.columns
       val columnMap = columns.map(c => (c.columnName, c)).toMap
       val addedOrderedColumns = order.flatMap(columnMap.get(_))
@@ -335,6 +449,43 @@ private[cli] object DdlCommand {
       this.copy(table = this.table.copy(columns = orderedColumns))
     }
   }
+
+  case class VerticaTableDefinition(
+    path: String,
+    fileName: String,
+    header: String,
+    schemaCreate: String,
+    table: vDdl.Table,
+    comment: vDdl.Comment) {
+    /**
+     * Get same DDL file with all column names being snakified
+     */
+    def snakifyTable: vDdl.Table = {
+      val snakified = table.columns.map { column =>
+        column.copy(columnName = SU.snakify(column.columnName)) }
+      table.copy(columns = snakified)
+    }
+
+    /**
+     * Pick columns listed in `order` (and presented in [[table]]
+     * at the same time) and appends them to the end of original [[table]],
+     * leaving not listed in `order` on their places
+     *
+     * @param order sublist of column names in right order that should be
+     *              appended to the end of table
+     * @return DDL file object with reordered columns
+     */
+    def reorderTable(order: List[String]): VerticaTableDefinition = {
+      val columns = table.columns
+      val columnMap = columns.map(c => (c.columnName, c)).toMap
+      val addedOrderedColumns = order.flatMap(columnMap.get(_))
+      val columnsToSort = order intersect columns.map(_.columnName)
+      val initialColumns = columns.filterNot(c => columnsToSort.contains(c.columnName))
+      val orderedColumns = initialColumns ++ addedOrderedColumns
+      this.copy(table = this.table.copy(columns = orderedColumns))
+    }
+  }
+
 
   /**
    * Get the file path and name from self-describing info
@@ -371,8 +522,24 @@ private[cli] object DdlCommand {
    * @param ddls list of pairs
    * @return Map with latest table definition for each Schema addition
    */
-  private def groupWithLast(ddls: List[(SchemaDescription, TableDefinition)]) = {
-    val aggregated = ddls.foldLeft(Map.empty[ModelCriterion, (SchemaDescription, TableDefinition)]) {
+  private def groupWithRedshiftLast(ddls: List[(SchemaDescription, RedshiftTableDefinition)]) = {
+    val aggregated = ddls.foldLeft(Map.empty[ModelCriterion, (SchemaDescription, RedshiftTableDefinition)]) {
+      case (acc, (description, definition)) =>
+        acc.get(description.modelCriterion) match {
+          case Some((desc, defn)) if desc.version.revision < description.version.revision =>
+            acc ++ Map((description.modelCriterion, (description, definition)))
+          case Some((desc, defn)) if desc.version.revision == description.version.revision &&
+            desc.version.addition < description.version.addition =>
+            acc ++ Map((description.modelCriterion, (description, definition)))
+          case None =>
+            acc ++ Map((description.modelCriterion, (description, definition)))
+          case _ => acc
+        }
+    }
+    aggregated.map { case (revision, (desc, defn)) => (desc, defn) }
+  }
+  private def groupWithVerticaLast(ddls: List[(SchemaDescription, VerticaTableDefinition)]) = {
+    val aggregated = ddls.foldLeft(Map.empty[ModelCriterion, (SchemaDescription, VerticaTableDefinition)]) {
       case (acc, (description, definition)) =>
         acc.get(description.modelCriterion) match {
           case Some((desc, defn)) if desc.version.revision < description.version.revision =>
